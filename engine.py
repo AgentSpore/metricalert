@@ -119,3 +119,34 @@ async def resolve_alert(db, alert_id: int) -> dict | None:
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM alerts_fired WHERE id=?", (alert_id,))
     return _row(rows[0]) if rows else None
+
+async def delete_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
+    """Delete an alert rule by ID."""
+    cur = await db.execute("DELETE FROM alert_rules WHERE id=?", (rule_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+async def toggle_rule(db: aiosqlite.Connection, rule_id: int, active: bool) -> dict | None:
+    """Enable or disable an alert rule without deleting it."""
+    await db.execute("UPDATE alert_rules SET active=? WHERE id=?", (1 if active else 0, rule_id))
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id=?", (rule_id,))
+    return _row(rows[0]) if rows else None
+
+async def get_metric_stats(db: aiosqlite.Connection, name: str, minutes: int = 60) -> dict:
+    """Aggregated stats for a metric over a time window."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT MIN(value) as min, MAX(value) as max, AVG(value) as avg, COUNT(*) as count "
+        "FROM metrics WHERE name=? AND created_at>=?", (name, since)
+    )
+    r = rows[0] if rows else {}
+    return {
+        "metric_name": name,
+        "window_minutes": minutes,
+        "count": r["count"] or 0,
+        "min": round(r["min"] or 0, 4),
+        "max": round(r["max"] or 0, 4),
+        "avg": round(r["avg"] or 0, 4),
+    }
+
