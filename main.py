@@ -1,10 +1,10 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
-from models import MetricPush, AlertRuleCreate, MetricPoint, AlertRule, AlertFired
+from models import MetricPush, AlertRuleCreate, AlertRuleUpdate, MetricPoint, MetricSummary, AlertRule, AlertFired
 from engine import (
-    init_db, push_metric, get_metric_series, get_metric_stats,
-    create_rule, list_rules, delete_rule, toggle_rule,
+    init_db, push_metric, list_metric_names, get_metric_series, get_metric_stats,
+    create_rule, list_rules, update_rule, delete_rule, toggle_rule,
     list_alerts, resolve_alert,
 )
 
@@ -23,7 +23,7 @@ app = FastAPI(
         "Push any number, define thresholds, get alerted when something breaks. "
         "No Datadog complexity, no enterprise pricing."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -31,6 +31,11 @@ app = FastAPI(
 async def push(body: MetricPush):
     """Push a metric value. Auto-checks active alert rules and fires alerts on breach."""
     return await push_metric(app.state.db, body.model_dump())
+
+@app.get("/metrics", response_model=list[MetricSummary])
+async def get_all_metrics():
+    """List all known metric names with last value, last seen, and total data point count."""
+    return await list_metric_names(app.state.db)
 
 @app.get("/metrics/{name}")
 async def metric_series(name: str, minutes: int = Query(60, description="Lookback window in minutes")):
@@ -53,6 +58,14 @@ async def create_alert_rule(body: AlertRuleCreate):
 async def get_rules():
     """List all configured alert rules."""
     return await list_rules(app.state.db)
+
+@app.patch("/rules/{rule_id}", response_model=AlertRule)
+async def patch_rule(rule_id: int, body: AlertRuleUpdate):
+    """Update rule threshold, window, or webhook without deleting and recreating."""
+    result = await update_rule(app.state.db, rule_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Rule not found")
+    return result
 
 @app.delete("/rules/{rule_id}", status_code=204)
 async def remove_rule(rule_id: int):
