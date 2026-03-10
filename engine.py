@@ -52,7 +52,6 @@ async def push_metric(db: aiosqlite.Connection, data: dict) -> dict:
         (data["name"], data["value"], data.get("tags"), now)
     )
     await db.commit()
-    # Check alert rules for this metric
     rules = await db.execute_fetchall(
         "SELECT * FROM alert_rules WHERE metric_name=? AND active=1", (data["name"],)
     )
@@ -82,6 +81,30 @@ async def push_metric(db: aiosqlite.Connection, data: dict) -> dict:
     rows = await db.execute_fetchall("SELECT * FROM metrics WHERE id=?", (cur.lastrowid,))
     return _row(rows[0])
 
+async def list_metric_names(db: aiosqlite.Connection) -> list[dict]:
+    """List all distinct metric names with last value, last seen, and total data point count."""
+    rows = await db.execute_fetchall("""
+        SELECT
+            name,
+            COUNT(*) AS total_points,
+            MAX(value) AS last_value,
+            MAX(created_at) AS last_seen,
+            MIN(created_at) AS first_seen
+        FROM metrics
+        GROUP BY name
+        ORDER BY last_seen DESC
+    """)
+    return [
+        {
+            "name": r["name"],
+            "total_points": r["total_points"],
+            "last_value": r["last_value"],
+            "last_seen": r["last_seen"],
+            "first_seen": r["first_seen"],
+        }
+        for r in rows
+    ]
+
 async def get_metric_series(db, name: str, minutes: int = 60) -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
     rows = await db.execute_fetchall(
@@ -99,6 +122,21 @@ async def create_rule(db, data: dict) -> dict:
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id=?", (cur.lastrowid,))
     return _row(rows[0])
+
+async def update_rule(db: aiosqlite.Connection, rule_id: int, updates: dict) -> dict | None:
+    allowed = {"threshold", "window_minutes", "notify_url"}
+    fields = {k: v for k, v in updates.items() if k in allowed}
+    if not fields:
+        rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id=?", (rule_id,))
+        return _row(rows[0]) if rows else None
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [rule_id]
+    cur = await db.execute(f"UPDATE alert_rules SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id=?", (rule_id,))
+    return _row(rows[0]) if rows else None
 
 async def list_rules(db) -> list[dict]:
     rows = await db.execute_fetchall("SELECT * FROM alert_rules ORDER BY created_at DESC")
@@ -121,20 +159,17 @@ async def resolve_alert(db, alert_id: int) -> dict | None:
     return _row(rows[0]) if rows else None
 
 async def delete_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
-    """Delete an alert rule by ID."""
     cur = await db.execute("DELETE FROM alert_rules WHERE id=?", (rule_id,))
     await db.commit()
     return cur.rowcount > 0
 
 async def toggle_rule(db: aiosqlite.Connection, rule_id: int, active: bool) -> dict | None:
-    """Enable or disable an alert rule without deleting it."""
     await db.execute("UPDATE alert_rules SET active=? WHERE id=?", (1 if active else 0, rule_id))
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM alert_rules WHERE id=?", (rule_id,))
     return _row(rows[0]) if rows else None
 
 async def get_metric_stats(db: aiosqlite.Connection, name: str, minutes: int = 60) -> dict:
-    """Aggregated stats for a metric over a time window."""
     since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
     rows = await db.execute_fetchall(
         "SELECT MIN(value) as min, MAX(value) as max, AVG(value) as avg, COUNT(*) as count "
@@ -149,4 +184,3 @@ async def get_metric_stats(db: aiosqlite.Connection, name: str, minutes: int = 6
         "max": round(r["max"] or 0, 4),
         "avg": round(r["avg"] or 0, 4),
     }
-
