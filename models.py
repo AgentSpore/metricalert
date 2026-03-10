@@ -1,19 +1,26 @@
 from __future__ import annotations
 from pydantic import BaseModel
+from typing import Optional
 
 
 class MetricPush(BaseModel):
-    name: str           # e.g. "revenue", "error_rate", "signups"
+    name: str
     value: float
-    tags: str | None = None   # e.g. "env=prod,region=us"
+    tags: str | None = None
 
 
 class AlertRuleCreate(BaseModel):
     metric_name: str
-    condition: str      # gt | lt | gte | lte
+    condition: str
     threshold: float
     window_minutes: int = 5
-    notify_url: str | None = None   # webhook URL
+    notify_url: str | None = None
+
+
+class AlertRuleUpdate(BaseModel):
+    threshold: Optional[float] = None
+    window_minutes: Optional[int] = None
+    notify_url: Optional[str] = None
 
 
 class MetricPoint(BaseModel):
@@ -22,6 +29,14 @@ class MetricPoint(BaseModel):
     value: float
     tags: str | None
     created_at: str
+
+
+class MetricSummary(BaseModel):
+    name: str
+    total_points: int
+    last_value: float
+    last_seen: str
+    first_seen: str
 
 
 class AlertRule(BaseModel):
