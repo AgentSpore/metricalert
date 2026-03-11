@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -58,3 +58,37 @@ class AlertFired(BaseModel):
     threshold: float
     created_at: str
     resolved_at: str | None
+
+
+class BaselineCompute(BaseModel):
+    window_hours: int = Field(24, ge=1, le=168, description="Hours of history to compute baseline from")
+
+
+class BaselineResponse(BaseModel):
+    metric_name: str
+    mean: float
+    stddev: float
+    min: float
+    max: float
+    p50: float
+    p95: float
+    p99: float
+    sample_size: int
+    window_hours: int
+    computed_at: str
+
+
+class AnomalyPoint(BaseModel):
+    id: int
+    value: float
+    deviation_sigma: float
+    tags: str | None
+    created_at: str
+
+
+class AutoRuleCreate(BaseModel):
+    metric_name: str
+    sigma: float = Field(3.0, gt=0, le=10, description="Number of standard deviations for threshold")
+    condition: str = Field("gt", description="gt or lt")
+    window_minutes: int = Field(5, ge=1)
+    notify_url: str | None = None

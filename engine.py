@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import httpx
 from datetime import datetime, timezone, timedelta
 import aiosqlite
@@ -30,6 +31,19 @@ CREATE TABLE IF NOT EXISTS alerts_fired (
     created_at TEXT NOT NULL,
     resolved_at TEXT,
     FOREIGN KEY (rule_id) REFERENCES alert_rules(id)
+);
+CREATE TABLE IF NOT EXISTS baselines (
+    metric_name TEXT PRIMARY KEY,
+    mean REAL NOT NULL,
+    stddev REAL NOT NULL,
+    min_val REAL NOT NULL,
+    max_val REAL NOT NULL,
+    p50 REAL NOT NULL,
+    p95 REAL NOT NULL,
+    p99 REAL NOT NULL,
+    sample_size INTEGER NOT NULL,
+    window_hours INTEGER NOT NULL,
+    computed_at TEXT NOT NULL
 );
 """
 
@@ -82,7 +96,6 @@ async def push_metric(db: aiosqlite.Connection, data: dict) -> dict:
     return _row(rows[0])
 
 async def list_metric_names(db: aiosqlite.Connection) -> list[dict]:
-    """List all distinct metric names with last value, last seen, and total data point count."""
     rows = await db.execute_fetchall("""
         SELECT
             name,
@@ -184,3 +197,135 @@ async def get_metric_stats(db: aiosqlite.Connection, name: str, minutes: int = 6
         "max": round(r["max"] or 0, 4),
         "avg": round(r["avg"] or 0, 4),
     }
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    if not sorted_values:
+        return 0.0
+    k = (len(sorted_values) - 1) * (p / 100)
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_values[int(k)]
+    return sorted_values[f] * (c - k) + sorted_values[c] * (k - f)
+
+
+async def compute_baseline(db: aiosqlite.Connection, name: str, window_hours: int = 24) -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT value FROM metrics WHERE name=? AND created_at>=? ORDER BY value ASC",
+        (name, since),
+    )
+    values = [r["value"] for r in rows]
+    if len(values) < 10:
+        raise ValueError(f"Need at least 10 data points, got {len(values)}")
+
+    n = len(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n
+    stddev = math.sqrt(variance)
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        """INSERT INTO baselines (metric_name, mean, stddev, min_val, max_val, p50, p95, p99, sample_size, window_hours, computed_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(metric_name) DO UPDATE SET
+             mean=excluded.mean, stddev=excluded.stddev, min_val=excluded.min_val,
+             max_val=excluded.max_val, p50=excluded.p50, p95=excluded.p95, p99=excluded.p99,
+             sample_size=excluded.sample_size, window_hours=excluded.window_hours, computed_at=excluded.computed_at""",
+        (name, mean, stddev, values[0], values[-1],
+         _percentile(values, 50), _percentile(values, 95), _percentile(values, 99),
+         n, window_hours, now),
+    )
+    await db.commit()
+
+    return {
+        "metric_name": name,
+        "mean": round(mean, 4),
+        "stddev": round(stddev, 4),
+        "min": round(values[0], 4),
+        "max": round(values[-1], 4),
+        "p50": round(_percentile(values, 50), 4),
+        "p95": round(_percentile(values, 95), 4),
+        "p99": round(_percentile(values, 99), 4),
+        "sample_size": n,
+        "window_hours": window_hours,
+        "computed_at": now,
+    }
+
+
+async def get_baseline(db: aiosqlite.Connection, name: str) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM baselines WHERE metric_name=?", (name,)
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "metric_name": r["metric_name"],
+        "mean": round(r["mean"], 4),
+        "stddev": round(r["stddev"], 4),
+        "min": round(r["min_val"], 4),
+        "max": round(r["max_val"], 4),
+        "p50": round(r["p50"], 4),
+        "p95": round(r["p95"], 4),
+        "p99": round(r["p99"], 4),
+        "sample_size": r["sample_size"],
+        "window_hours": r["window_hours"],
+        "computed_at": r["computed_at"],
+    }
+
+
+async def find_anomalies(db: aiosqlite.Connection, name: str, sigma: float = 3.0, hours: int = 1) -> list[dict]:
+    baseline = await get_baseline(db, name)
+    if not baseline:
+        raise ValueError("No baseline computed for this metric. POST /metrics/{name}/baseline first.")
+
+    mean = baseline["mean"]
+    stddev = baseline["stddev"]
+    if stddev == 0:
+        return []
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM metrics WHERE name=? AND created_at>=? ORDER BY created_at DESC",
+        (name, since),
+    )
+
+    anomalies = []
+    for r in rows:
+        deviation = abs(r["value"] - mean) / stddev
+        if deviation >= sigma:
+            anomalies.append({
+                "id": r["id"],
+                "value": r["value"],
+                "deviation_sigma": round(deviation, 2),
+                "tags": r["tags"],
+                "created_at": r["created_at"],
+            })
+    return anomalies
+
+
+async def create_auto_rule(db: aiosqlite.Connection, data: dict) -> dict:
+    name = data["metric_name"]
+    baseline = await get_baseline(db, name)
+    if not baseline:
+        raise ValueError("No baseline computed. POST /metrics/{name}/baseline first.")
+
+    sigma = data.get("sigma", 3.0)
+    condition = data.get("condition", "gt")
+
+    if condition == "gt":
+        threshold = baseline["mean"] + sigma * baseline["stddev"]
+    elif condition == "lt":
+        threshold = baseline["mean"] - sigma * baseline["stddev"]
+    else:
+        raise ValueError("condition must be 'gt' or 'lt'")
+
+    return await create_rule(db, {
+        "metric_name": name,
+        "condition": condition,
+        "threshold": round(threshold, 4),
+        "window_minutes": data.get("window_minutes", 5),
+        "notify_url": data.get("notify_url"),
+    })

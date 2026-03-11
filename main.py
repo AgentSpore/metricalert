@@ -1,11 +1,15 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
-from models import MetricPush, AlertRuleCreate, AlertRuleUpdate, MetricPoint, MetricSummary, AlertRule, AlertFired
+from models import (
+    MetricPush, AlertRuleCreate, AlertRuleUpdate, MetricPoint, MetricSummary,
+    AlertRule, AlertFired, BaselineCompute, BaselineResponse, AnomalyPoint, AutoRuleCreate,
+)
 from engine import (
     init_db, push_metric, list_metric_names, get_metric_series, get_metric_stats,
     create_rule, list_rules, update_rule, delete_rule, toggle_rule,
     list_alerts, resolve_alert,
+    compute_baseline, get_baseline, find_anomalies, create_auto_rule,
 )
 
 DB_PATH = "metricalert.db"
@@ -19,11 +23,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MetricAlert",
     description=(
-        "Lightweight metric alerting for small SaaS teams. "
-        "Push any number, define thresholds, get alerted when something breaks. "
+        "Lightweight metric alerting with anomaly detection. "
+        "Push metrics, set thresholds or auto-detect anomalies via statistical baselines. "
         "No Datadog complexity, no enterprise pricing."
     ),
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -47,6 +51,34 @@ async def metric_stats(name: str, minutes: int = Query(60)):
     """Aggregated stats for a metric: min, max, avg, count over the time window."""
     return await get_metric_stats(app.state.db, name, minutes)
 
+@app.post("/metrics/{name}/baseline", response_model=BaselineResponse)
+async def create_baseline(name: str, body: BaselineCompute = BaselineCompute()):
+    """Compute statistical baseline (mean, stddev, percentiles) from recent data. Min 10 points required."""
+    try:
+        return await compute_baseline(app.state.db, name, body.window_hours)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/metrics/{name}/baseline", response_model=BaselineResponse)
+async def view_baseline(name: str):
+    """View the last computed baseline for a metric."""
+    result = await get_baseline(app.state.db, name)
+    if not result:
+        raise HTTPException(404, "No baseline computed. POST /metrics/{name}/baseline first.")
+    return result
+
+@app.get("/metrics/{name}/anomalies", response_model=list[AnomalyPoint])
+async def detect_anomalies(
+    name: str,
+    sigma: float = Query(3.0, gt=0, le=10, description="Deviation threshold in standard deviations"),
+    hours: int = Query(1, ge=1, le=168, description="Lookback window in hours"),
+):
+    """Find data points that deviate more than N sigma from the baseline."""
+    try:
+        return await find_anomalies(app.state.db, name, sigma, hours)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @app.post("/rules", response_model=AlertRule, status_code=201)
 async def create_alert_rule(body: AlertRuleCreate):
     """Define an alert rule. Condition: gt | lt | gte | lte. Optional webhook URL."""
@@ -54,14 +86,22 @@ async def create_alert_rule(body: AlertRuleCreate):
         raise HTTPException(422, "condition must be: gt | lt | gte | lte")
     return await create_rule(app.state.db, body.model_dump())
 
+@app.post("/rules/auto", response_model=AlertRule, status_code=201)
+async def create_auto_alert_rule(body: AutoRuleCreate):
+    """Create alert rule with threshold auto-calculated from baseline (mean + sigma * stddev)."""
+    if body.condition not in ("gt", "lt"):
+        raise HTTPException(422, "condition must be 'gt' or 'lt' for auto rules")
+    try:
+        return await create_auto_rule(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @app.get("/rules", response_model=list[AlertRule])
 async def get_rules():
-    """List all configured alert rules."""
     return await list_rules(app.state.db)
 
 @app.patch("/rules/{rule_id}", response_model=AlertRule)
 async def patch_rule(rule_id: int, body: AlertRuleUpdate):
-    """Update rule threshold, window, or webhook without deleting and recreating."""
     result = await update_rule(app.state.db, rule_id, body.model_dump(exclude_unset=True))
     if not result:
         raise HTTPException(404, "Rule not found")
@@ -69,14 +109,12 @@ async def patch_rule(rule_id: int, body: AlertRuleUpdate):
 
 @app.delete("/rules/{rule_id}", status_code=204)
 async def remove_rule(rule_id: int):
-    """Delete an alert rule permanently."""
     ok = await delete_rule(app.state.db, rule_id)
     if not ok:
         raise HTTPException(404, "Rule not found")
 
 @app.post("/rules/{rule_id}/toggle")
 async def toggle_alert_rule(rule_id: int, active: bool = Query(...)):
-    """Enable or disable an alert rule without deleting it."""
     result = await toggle_rule(app.state.db, rule_id, active)
     if not result:
         raise HTTPException(404, "Rule not found")
@@ -84,12 +122,10 @@ async def toggle_alert_rule(rule_id: int, active: bool = Query(...)):
 
 @app.get("/alerts", response_model=list[AlertFired])
 async def get_alerts(unresolved_only: bool = Query(False)):
-    """List fired alerts. unresolved_only=true for active incidents."""
     return await list_alerts(app.state.db, unresolved_only)
 
 @app.post("/alerts/{alert_id}/resolve", response_model=AlertFired)
 async def resolve(alert_id: int):
-    """Mark a fired alert as resolved."""
     result = await resolve_alert(app.state.db, alert_id)
     if not result:
         raise HTTPException(404, "Alert not found")
